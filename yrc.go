@@ -2,13 +2,18 @@ package yrc
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/Arceliar/ironwood/types"
+	"github.com/yggdrasil-network/yggdrasil-go/src/config"
+	"github.com/yggdrasil-network/yggdrasil-go/src/core"
+	"github.com/yggdrasil-network/yggdrasil-go/src/multicast"
 	"golang.org/x/crypto/blake2s"
 )
 
@@ -24,10 +29,11 @@ import (
 // TODO: Convert send progress []bool to progress []byte to reflect staged/flying/sent ternary status
 // TODO: Add a way to cancel receiving message
 // TODO: Add message receive timeout
+// TODO: Solve potential AcceptMessage concurrency issues
 
 const HelloInterval = time.Second*60
 const AliveTimeout = time.Second*120
-const RefreshInterval = time.Second
+const RefreshInterval = time.Second*5
 
 const MaxFlyingCountGlobal = 32
 const MaxFlyingCountMessage = 8
@@ -42,7 +48,7 @@ const (
 	typeSessionTraffic
 	typeSessionProto
 	
-	typeYrcV0_1_0 = 42
+	typeYrcV1 = 42
 )
 
 // Yggdrasil protocol packet sub-types
@@ -55,11 +61,11 @@ const (
 
 // Yrc packet sub-types
 const (
-	YrcHello = iota
-	YrcOlleh
-	YrcFrag
-    YrcFragAck
-    YrcFragNak
+	YrcHello = iota // Ping
+	YrcOlleh // Pong
+	YrcFrag // Fragment body
+    YrcFragAck // Fragment acknowledgement
+    YrcFragNak // Fragment negative acknowledgement
 )
 
 // Yrc fragmented packet types
@@ -230,8 +236,11 @@ type AliveEntry struct {
 	time time.Time
 }
 
-type Transport struct {
-	Ygg *Ygg
+type Yrc struct {
+	Log core.Logger
+	
+	C *core.Core
+	M *multicast.Multicast
 
 	ctx context.Context
 
@@ -258,7 +267,7 @@ type Transport struct {
 	aliveLock sync.RWMutex
 	aliveList []AliveEntry
 
-	tickChan chan<- struct{}
+	tickChan chan struct{}
 }
 
 type YrcError struct {
@@ -272,91 +281,96 @@ func (e YrcError) Error() string {
 // Closes the transport,
 // meaning all its connections will be closed
 // and it will no longer be able to process outgoing or incoming packets
-func (t *Transport) Close() {
-	t.Ygg.Close()
+func (y *Yrc) Close() {
+	y.C.Close()
+	y.M.Stop()
 }
 
 // Triggers process* function to be ran as soon as possible
-func (t *Transport) tick() {
-	t.tickChan<- struct{}{}
+func (y *Yrc) tick() {
+	y.tickChan<- struct{}{}
 }
 
 // Adds an address to periodically send a 'hello' packet to
-func (t *Transport) AddHello(addr types.Addr) {
-	t.helloLock.Lock()
-	for i := range t.helloList {
-		it := &t.helloList[i]
+func (y *Yrc) AddHello(addr types.Addr) {
+	y.helloLock.Lock()
+	for i := range y.helloList {
+		it := &y.helloList[i]
 		if isSliceEq(it.addr, addr) {
 			it.temp = false
-			t.helloLock.Unlock()
+			y.helloLock.Unlock()
 			return
 		}
 	}
-	t.helloList = append(t.helloList, HelloEntry{
+	y.helloList = append(y.helloList, HelloEntry{
 		addr: addr, 
 		time: time.Unix(0, 0), 
 		refs: [][84]byte{}, 
 		temp: false,
 	})
-	t.helloLock.Unlock()
-	t.Ygg.C.PacketConn.WriteTo([]byte{typeYrcV0_1_0, YrcHello}, addr)
+	y.helloLock.Unlock()
+	if _, err := y.C.PacketConn.WriteTo([]byte{typeYrcV1, YrcHello}, addr); err != types.ErrClosed {
+		y.Log.Errorln(err)
+	}
 }
 
 // Removes an address from the periodical 'hello' list
-func (t *Transport) RemoveHello(addr types.Addr) {
-	t.helloLock.Lock()
-	for i := 0; i < len(t.helloList); i++ {
-		it := &t.helloList[i]
+func (y *Yrc) RemoveHello(addr types.Addr) {
+	y.helloLock.Lock()
+	for i := 0; i < len(y.helloList); i++ {
+		it := &y.helloList[i]
 		if isSliceEq(it.addr, addr) {
 			it.temp = true
 			if len(it.refs) > 0 {
-				t.helloLock.Unlock()
+				y.helloLock.Unlock()
 				return
 			}
-			lenmo := len(t.helloList)-1
-			*it = t.helloList[lenmo]
-			t.helloList = t.helloList[:lenmo]
-			t.helloLock.Unlock()
+			lenmo := len(y.helloList)-1
+			*it = y.helloList[lenmo]
+			y.helloList = y.helloList[:lenmo]
+			y.helloLock.Unlock()
 			return
 		}
 	}
-	t.helloLock.Unlock()
+	y.helloLock.Unlock()
 }
 
-func (t *Transport) AddTempHello(addr types.Addr, key [84]byte) {
-	t.helloLock.Lock()
-	for i := range t.helloList {
-		it := &t.helloList[i]
+// Adds a temporary hello entry, linked to a specific bound identifier
+func (y *Yrc) AddTempHello(addr types.Addr, key [84]byte) {
+	y.helloLock.Lock()
+	for i := range y.helloList {
+		it := &y.helloList[i]
 		if isSliceEq(it.addr, addr) {
 			for j := range len(it.refs) {
 				if isSliceEq(key[:], it.refs[j][:]) {
-					t.helloLock.Unlock()
+					y.helloLock.Unlock()
 					return
 				}
 			}
 			it.refs = append(it.refs, key)
-			t.helloLock.Unlock()
+			y.helloLock.Unlock()
 			return
 		}
 	}
-	t.helloList = append(t.helloList, HelloEntry{
+	y.helloList = append(y.helloList, HelloEntry{
 		addr: addr, 
 		time: time.Unix(0, 0), 
 		refs: [][84]byte{key}, 
 		temp: true,
 	})
-	t.helloLock.Unlock()
+	y.helloLock.Unlock()
 }
 
-func (t *Transport) RemoveTempHello(addr types.Addr, key [84]byte) {
-	t.helloLock.Lock()
-	for i := 0; i < len(t.helloList); i++ {
-		it := &t.helloList[i]
+// Removes a temporary hello entry, linked to a specific bound identifier
+func (y *Yrc) RemoveTempHello(addr types.Addr, key [84]byte) {
+	y.helloLock.Lock()
+	for i := 0; i < len(y.helloList); i++ {
+		it := &y.helloList[i]
 		if isSliceEq(it.addr, addr) {
 			if len(it.refs) > 0 {
 				if len(it.refs) == 1 {
 					if !isSliceEq(it.refs[0][:], key[:]) {
-						t.helloLock.Unlock()
+						y.helloLock.Unlock()
 						return
 					}
 				} else {
@@ -365,120 +379,121 @@ func (t *Transport) RemoveTempHello(addr types.Addr, key [84]byte) {
 							lenmo := len(it.refs)-1
 							it.refs[j] = it.refs[lenmo]
 							it.refs = it.refs[:lenmo]
-							t.helloLock.Unlock()
+							y.helloLock.Unlock()
 							return		
 						}
 					}
-					t.helloLock.Unlock()
+					y.helloLock.Unlock()
 					return
 				}
 			}
 			if !it.temp {
-				t.helloLock.Unlock()
+				y.helloLock.Unlock()
 				return
 			}
-			lenmo := len(t.helloList)-1
-			*it = t.helloList[lenmo]
-			t.helloList = t.helloList[:lenmo]
-			t.helloLock.Unlock()
+			lenmo := len(y.helloList)-1
+			*it = y.helloList[lenmo]
+			y.helloList = y.helloList[:lenmo]
+			y.helloLock.Unlock()
 			return
 		}
 	}
-	t.helloLock.Unlock()
+	y.helloLock.Unlock()
 }
 
 // Checks whether an address is part of the hello list
-func (t *Transport) IsHello(addr types.Addr) bool {
-	t.helloLock.RLock()
-	for _, it := range t.helloList {
+func (y *Yrc) IsHello(addr types.Addr) bool {
+	y.helloLock.RLock()
+	for _, it := range y.helloList {
 		if isSliceEq(it.addr, addr) {
-			t.helloLock.RUnlock()
+			y.helloLock.RUnlock()
 			return true
 		}
 	}
-	t.helloLock.RUnlock()
+	y.helloLock.RUnlock()
 	return false
 }
 
 // Lists all addresses in the periodical 'hello' list
-func (t *Transport) GetHelloList() []types.Addr {
-	list := make([]types.Addr, len(t.helloList))
-	t.helloLock.RLock()
-	for i, it := range t.helloList {
+func (y *Yrc) GetHelloList() []types.Addr {
+	list := make([]types.Addr, len(y.helloList))
+	y.helloLock.RLock()
+	for i, it := range y.helloList {
 		list[i] = it.addr
 	}
-	t.helloLock.RUnlock()
+	y.helloLock.RUnlock()
 	return list
 }
 
 // Marks an address as currently alive
-func (t *Transport) AddAlive(addr types.Addr) {
+func (y *Yrc) AddAlive(addr types.Addr) {
 	now := time.Now()
-	t.aliveLock.Lock()
-	for i := range t.aliveList {
-		if isSliceEq(t.aliveList[i].addr, addr) {
-			t.aliveList[i].time = now
-			t.aliveLock.Unlock()
+	y.aliveLock.Lock()
+	for i := range y.aliveList {
+		if isSliceEq(y.aliveList[i].addr, addr) {
+			y.aliveList[i].time = now
+			y.aliveLock.Unlock()
 			return
 		}
 	}
-	t.aliveList = append(t.aliveList, AliveEntry{addr, now})
-	t.aliveLock.Unlock()
+	y.aliveList = append(y.aliveList, AliveEntry{addr, now})
+	y.aliveLock.Unlock()
 }
 
 // Marks an address as dead
-func (t *Transport) RemoveAlive(addr types.Addr) {
-	t.aliveLock.Lock()
-	for i := 0; i < len(t.aliveList); {
-		if isSliceEq(t.aliveList[i].addr, addr) {
-			lenmo := len(t.aliveList)-1
-			t.aliveList[i] = t.aliveList[lenmo]
-			t.aliveList = t.aliveList[:lenmo]
+func (y *Yrc) RemoveAlive(addr types.Addr) {
+	y.aliveLock.Lock()
+	for i := 0; i < len(y.aliveList); {
+		if isSliceEq(y.aliveList[i].addr, addr) {
+			lenmo := len(y.aliveList)-1
+			y.aliveList[i] = y.aliveList[lenmo]
+			y.aliveList = y.aliveList[:lenmo]
 			continue
 		}
 		i++
 	}
-	t.aliveLock.Unlock()
+	y.aliveLock.Unlock()
 }
 
 // Checks whether an address is alive
-func (t *Transport) IsAlive(addr types.Addr) bool {
-	t.aliveLock.RLock()
-	for _, it := range t.aliveList {
+func (y *Yrc) IsAlive(addr types.Addr) bool {
+	y.aliveLock.RLock()
+	for _, it := range y.aliveList {
 		if isSliceEq(it.addr, addr) {
-			t.aliveLock.RUnlock()
+			y.aliveLock.RUnlock()
 			return time.Now().Before(it.time.Add(AliveTimeout))
 		}
 	}
-	t.aliveLock.RUnlock()
+	y.aliveLock.RUnlock()
 	return false
 }
 
 // Lists all of the currently alive addresses
-func (t *Transport) GetAliveList() []types.Addr {
-	list := make([]types.Addr, len(t.aliveList))
+func (y *Yrc) GetAliveList() []types.Addr {
+	list := make([]types.Addr, len(y.aliveList))
 	count := 0
 	now := time.Now()
-	t.aliveLock.RLock()
-	for _, it := range t.aliveList {
+	y.aliveLock.RLock()
+	for _, it := range y.aliveList {
 		if now.Before(it.time.Add(AliveTimeout)) {
 			list[count] = it.addr
 			count++
 		}
 	}
-	t.aliveLock.RUnlock()
+	y.aliveLock.RUnlock()
 	return list[:count]
 }
 
 // Sends a message and returns its key
+//
 // TODO: Return ident instead of key?
-func (t *Transport) SendMessage(bytes []byte, to types.Addr) (key [84]byte, err error) {
+func (y *Yrc) SendMessage(bytes []byte, to types.Addr) (key [84]byte, err error) {
 	if len(bytes) >= 0xFFFFFFFF {
 		err = YrcError{m: "Message too long"}
 		return
 	}
 	// TODO: Add compression
-	fragSize := min(t.FragSize(), uint32(len(bytes)))
+	fragSize := min(y.FragSize(), uint32(len(bytes)))
 	fragCount := ceildiv(uint32(len(bytes)), fragSize)
 	ident := Ident{
 		Hash: blake2s.Sum256(bytes),
@@ -497,39 +512,40 @@ func (t *Transport) SendMessage(bytes []byte, to types.Addr) (key [84]byte, err 
 		frag.expiresAt = time.Unix(0, 0)
 	}
 	if err = ident.MessageKeyInto(key[:], to); err != nil {
-		t.Ygg.Log.Errorln(err)
+		y.Log.Errorln(err)
 		return
 	}
-	t.stagedLock.Lock()
-	t.staged[key] = StagedMessage{
+	y.stagedLock.Lock()
+	y.staged[key] = StagedMessage{
 		ident: ident,
 		to: to,
 		nonce: [NonceSize]byte{},
 		fragments: fragments,
 	}
-	t.stagedLock.Unlock()
-	t.AddTempHello(to, key)
-	go t.tick()
+	y.stagedLock.Unlock()
+	y.AddTempHello(to, key)
+	go y.tick()
 	return key, nil
 }
 
 // Cancels a sending message
-func (t *Transport) CancelMessage(key [84]byte) {
-	t.stagedLock.Lock()
-	if msg, hasMsg := t.staged[key]; hasMsg {
-		t.RemoveTempHello(msg.to, key)
-		delete(t.staged, key)
+func (y *Yrc) CancelMessage(key [84]byte) {
+	y.stagedLock.Lock()
+	if msg, hasMsg := y.staged[key]; hasMsg {
+		y.RemoveTempHello(msg.to, key)
+		delete(y.staged, key)
 	}
-	t.stagedLock.Unlock()
+	y.stagedLock.Unlock()
 }
 
-func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
+// Callback to handle Yrc packets
+func (y *Yrc) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 	reply := func(kind int, body []byte) error {
 		buf := make([]byte, len(body)+2)
-		buf[0] = typeYrcV0_1_0
+		buf[0] = typeYrcV1
 		buf[1] = byte(kind)
 		copy(buf[2:], body)
-		if _, err := t.Ygg.C.PacketConn.WriteTo(buf, from); err != nil {
+		if _, err := y.C.PacketConn.WriteTo(buf, from); err != nil {
 			return err
 		}
 		return nil
@@ -551,33 +567,33 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 		bytes = bytes[64:]
 
 		err := byte(ErrIgnore)
-		if t.AcceptPacket == nil || (!t.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
+		if y.AcceptPacket == nil || (!y.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
 			if err != ErrIgnore {
 				reply(YrcFragNak, append(identBytes[:], err))
 			}
-			t.receivingLock.RLock()
-			if _, hasCollector := t.receiving[messageKey]; hasCollector {
-				t.receivingLock.RUnlock()
-				t.receivingLock.Lock()
-				delete(t.receiving, messageKey)
-				t.receivingLock.Unlock()
-				if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, []bool{}, err)}
+			y.receivingLock.RLock()
+			if _, hasCollector := y.receiving[messageKey]; hasCollector {
+				y.receivingLock.RUnlock()
+				y.receivingLock.Lock()
+				delete(y.receiving, messageKey)
+				y.receivingLock.Unlock()
+				if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, []bool{}, err)}
 			} else {
-				t.receivingLock.RUnlock()
+				y.receivingLock.RUnlock()
 			}
 			return nil
 		}
 
-		t.receivingLock.Lock()
+		y.receivingLock.Lock()
 		
 		// Retreive an existing fragment collector for the message, or create one if the message is unknown
 		var collector FragmentCollector
 		{
 			var hasCollector bool
-			collector, hasCollector = t.receiving[messageKey]
+			collector, hasCollector = y.receiving[messageKey]
 			if !hasCollector {
-				if t.AcceptMessage == nil || (!t.AcceptMessage(from, ident, &err) && err != ErrOkay) {
-					t.receivingLock.Unlock()
+				if y.AcceptMessage == nil || (!y.AcceptMessage(from, ident, &err) && err != ErrOkay) {
+					y.receivingLock.Unlock()
 					if err != ErrIgnore {
 						reply(YrcFragNak, append(identBytes[:], err))
 					}
@@ -590,25 +606,25 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 					fragments: make([][]byte, ident.FragCount()),
 					nonce: nonce,
 				}
-				t.receiving[messageKey] = collector
+				y.receiving[messageKey] = collector
 			}
 		}
 		// TODO: Assumes collector.ident == ident, which may not be the case?
 		
 		// Bad fragment index
 		if uint64(ident.Index) >= ident.FragCount() {
-			delete(t.receiving, messageKey)
-			t.receivingLock.Unlock()
+			delete(y.receiving, messageKey)
+			y.receivingLock.Unlock()
 			reply(YrcFragNak, append(identBytes[:], ErrOutOfRange))
-			if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, []bool{}, ErrOutOfRange)}
+			if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, []bool{}, ErrOutOfRange)}
 			return nil
 		}
 		// Bad payload length
 		if uint32(len(bytes)) != ident.Fragsize && !(uint64(ident.Index) == ident.FragCount()-1 && uint32(len(bytes)) == ident.Compsize - uint32(ident.FragCount()-1)*ident.Fragsize) {
-			delete(t.receiving, messageKey)
-			t.receivingLock.Unlock()
+			delete(y.receiving, messageKey)
+			y.receivingLock.Unlock()
 			reply(YrcFragNak, append(identBytes[:], ErrOutOfRange))
-			if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, []bool{}, ErrOutOfRange)}
+			if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, []bool{}, ErrOutOfRange)}
 			return nil
 		}
 
@@ -626,8 +642,8 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 		
 		// Finalize reception
 		if count == collector.ident.FragCount() {
-			delete(t.receiving, messageKey)
-			t.receivingLock.Unlock()
+			delete(y.receiving, messageKey)
+			y.receivingLock.Unlock()
 
 			total := uint32(0)
 			for _, it := range collector.fragments {
@@ -635,7 +651,7 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 			}
 			if total != ident.Compsize {
 				reply(YrcFragNak, append(identBytes[:], ErrBadLength))
-				if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, []bool{}, ErrBadLength)}
+				if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, []bool{}, ErrBadLength)}
 				return nil
 			}
 			raw_body := make([]byte, ident.Compsize)
@@ -651,24 +667,25 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 			}
 			if body == nil || uint32(len(body)) != ident.Basesize {
 				reply(YrcFragNak, append(identBytes[:], ErrBadLength))
-				if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, []bool{}, ErrBadLength)}
+				if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, []bool{}, ErrBadLength)}
 				return nil
 			}
 
 			hash := blake2s.Sum256(body)
 			if !isSliceEq(hash[:], ident.Hash[:]) {
 				reply(YrcFragNak, append(identBytes[:], ErrBadHash))
-				if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, []bool{}, ErrBadHash)}
+				if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, []bool{}, ErrBadHash)}
 				return nil
 			}
 
-			if t.OnMessage != nil {t.OnMessage(from, ident, body)}
+			if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, progress, ErrOkay)}
+			if y.OnMessage != nil {y.OnMessage(from, ident, body)}
 		} else {
-			t.receivingLock.Unlock()
-			if t.OnRecvUpdate != nil {t.OnRecvUpdate(from, ident, progress, ErrOkay)}
+			y.receivingLock.Unlock()
+			if y.OnRecvUpdate != nil {y.OnRecvUpdate(from, ident, progress, ErrOkay)}
 		}
 
-		t.AddAlive(from)
+		y.AddAlive(from)
 		reply(YrcFragAck, append(identBytes[:], collector.nonce[:]...))
 		return nil
 		
@@ -683,14 +700,14 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 		bytes = bytes[64+NonceSize:]
 
 		err := byte(ErrIgnore)
-		if t.AcceptPacket == nil || (!t.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
+		if y.AcceptPacket == nil || (!y.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
 			// TODO: Remove from staged?
 			return nil
 		}
 
-		t.stagedLock.Lock()
+		y.stagedLock.Lock()
 
-		msg, hasMsg := t.staged[messageKey]
+		msg, hasMsg := y.staged[messageKey]
 		if hasMsg && ident.Index < uint32(len(msg.fragments)) {
 			isNull := isZeros(msg.nonce[:])
 			progress := make([]bool, len(msg.fragments))
@@ -719,18 +736,18 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 				msg.fragments[ident.Index].state = fragSent
 				progress[ident.Index] = true
 			}
-			if t.OnSendUpdate != nil {t.OnSendUpdate(from, ident, progress, ErrOkay)}
+			if y.OnSendUpdate != nil {y.OnSendUpdate(from, ident, progress, ErrOkay)}
 			if msg.Done() {
-				t.RemoveTempHello(msg.to, messageKey)
-				delete(t.staged, messageKey)
+				y.RemoveTempHello(msg.to, messageKey)
+				delete(y.staged, messageKey)
 			} else {
-				t.staged[messageKey] = msg
+				y.staged[messageKey] = msg
 			}
 		}
 
-		t.stagedLock.Unlock()
-		t.AddAlive(from)
-		go t.tick()
+		y.stagedLock.Unlock()
+		y.AddAlive(from)
+		go y.tick()
 		return nil
 
 	case YrcFragNak:
@@ -743,56 +760,57 @@ func (t *Transport) onYrcPacket(from types.Addr, kind int, bytes []byte) error {
 		bytes = bytes[65:]
 
 		err := byte(ErrIgnore)
-		if t.AcceptPacket == nil || (!t.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
+		if y.AcceptPacket == nil || (!y.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
 			// TODO: Remove from staged?
 			return nil
 		}
 
-		t.stagedLock.Lock()
+		y.stagedLock.Lock()
 
-		_, hasMsg := t.staged[messageKey]
+		_, hasMsg := y.staged[messageKey]
 		if !hasMsg {
-			t.stagedLock.Unlock()
-			t.AddAlive(from)
+			y.stagedLock.Unlock()
+			y.AddAlive(from)
 			return nil		
 		}
 
-		t.RemoveTempHello(from, messageKey)
-		delete(t.staged, messageKey)
+		y.RemoveTempHello(from, messageKey)
+		delete(y.staged, messageKey)
 
-		t.stagedLock.Unlock()
+		y.stagedLock.Unlock()
 
-		t.AddAlive(from)
-		if t.OnSendUpdate != nil {t.OnSendUpdate(from, ident, []bool{}, errCode)}
+		y.AddAlive(from)
+		if y.OnSendUpdate != nil {y.OnSendUpdate(from, ident, []bool{}, errCode)}
 		return nil
 		
 	case YrcHello:
 		err := byte(ErrIgnore)
-		if t.AcceptPacket == nil || (!t.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
+		if y.AcceptPacket == nil || (!y.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
 			// TODO: Remove from hello?
 			return nil
 		}
-		t.AddAlive(from)
+		y.AddAlive(from)
 		reply(YrcOlleh, bytes[:])
 		return nil
 
 	case YrcOlleh:
 		err := byte(ErrIgnore)
-		if t.AcceptPacket == nil || (!t.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
+		if y.AcceptPacket == nil || (!y.AcceptPacket(from, kind, bytes, &err) && err != ErrOkay) {
 			// TODO: Remove from hello?
 			return nil
 		}
-		t.AddAlive(from)
-		go t.tick()
+		y.AddAlive(from)
+		go y.tick()
 		return nil
 	}
 	
 	return nil
 }
 
-func (t *Transport) onRawData(from types.Addr, bytes []byte) error {
+// Callback to handle generic Yggdrasil packets
+func (y *Yrc) onRawData(from types.Addr, bytes []byte) error {
 	if len(bytes) < 1 {
-		t.Ygg.Log.Errorln("Missing packet kind")
+		y.Log.Errorln("Missing packet kind")
 		return nil
 	}
 	yggKind := bytes[0]
@@ -803,30 +821,31 @@ func (t *Transport) onRawData(from types.Addr, bytes []byte) error {
 		bytes = bytes[1:]
 		switch reqKind {
 		case typeProtoNodeInfoRequest:
-			_, err := t.Ygg.C.PacketConn.WriteTo([]byte{2, 2, 110, 117, 108, 108}, from)
+			_, err := y.C.PacketConn.WriteTo([]byte{2, 2, 110, 117, 108, 108}, from)
 			if err != nil {
 				return err
 			}
 		}
 	case typeSessionTraffic:
 		// TODO: Find a way to handle this
-	case typeYrcV0_1_0:
+	case typeYrcV1:
 		yrcKind := int(bytes[0])
 		bytes = bytes[1:]
-		return t.onYrcPacket(from, yrcKind, bytes)
+		return y.onYrcPacket(from, yrcKind, bytes)
 	}
 	return  nil
 }
 
-func (t *Transport) FragSize() uint32 {
+// Returns the maximum size for a fragment's body
+func (y *Yrc) FragSize() uint32 {
 	// clamps MTU to 32 bits
 	// theoretically impossible lmfao
-	return uint32(min(t.Ygg.C.MTU() - 64 - 2, 0xFFFFFFFF))
+	return uint32(min(y.C.MTU() - 64 - 2, 0xFFFFFFFF))
 }
 
 // Process staged messages
-func (t *Transport) processStaged() {
-	if len(t.staged) == 0 {
+func (y *Yrc) processStaged() {
+	if len(y.staged) == 0 {
 		return
 	}
 
@@ -834,19 +853,19 @@ func (t *Transport) processStaged() {
 
 	flying := 0
 
-	t.stagedLock.Lock()
+	y.stagedLock.Lock()
 	
-	for key := range t.staged {
-		msg := t.staged[key]
+	for key := range y.staged {
+		msg := y.staged[key]
 		if msg.Done() {
-			t.RemoveTempHello(msg.to, key)
-			delete(t.staged, key)
+			y.RemoveTempHello(msg.to, key)
+			delete(y.staged, key)
 			continue
 		}
 		
 		updated := false
 		// TODO: Get alive list and then look up inside it
-		if !t.IsAlive(msg.to) {
+		if !y.IsAlive(msg.to) {
 			// stage back all flying fragments to a dead peer
 			for i := range msg.fragments {
 				frag := &msg.fragments[i]
@@ -870,19 +889,19 @@ func (t *Transport) processStaged() {
 			}
 		}
 		if updated {
-			t.staged[key] = msg
+			y.staged[key] = msg
 		}
 	}
 	
 	if flying >= MaxFlyingCountGlobal {
-		t.stagedLock.Unlock()
+		y.stagedLock.Unlock()
 		return
 	}
 	
-	for key := range t.staged {
-		msg := t.staged[key]
+	for key := range y.staged {
+		msg := y.staged[key]
 		// TODO: Get alive list and then look up inside it
-		if !t.IsAlive(msg.to) {
+		if !y.IsAlive(msg.to) {
 			continue
 		}
 		
@@ -910,16 +929,16 @@ func (t *Transport) processStaged() {
 				frag.expiresAt = now.Add(MaxFlyingTimeBase)
 				
 				pkt := make([]byte, len(frag.bytes)+66)
-				pkt[0] = typeYrcV0_1_0
+				pkt[0] = typeYrcV1
 				pkt[1] = YrcFrag
 				ident := msg.ident
 				ident.Index = uint32(i)
 				ident.BytesInto(pkt[2:])
 				copy(pkt[66:], frag.bytes)
 				
-				_, err := t.Ygg.C.PacketConn.WriteTo(pkt, msg.to)
+				_, err := y.C.PacketConn.WriteTo(pkt, msg.to)
 				if err != nil {
-					t.Ygg.Log.Errorln(err)
+					y.Log.Errorln(err)
 					return
 				}
 
@@ -929,51 +948,182 @@ func (t *Transport) processStaged() {
 			}
 		}
 		if updated {
-			t.staged[key] = msg
+			y.staged[key] = msg
 		}
 	}
-	t.stagedLock.Unlock()
+	y.stagedLock.Unlock()
 }
 
 // Process pending 'hello' transmissions
-func (t *Transport) processHello() {
+func (y *Yrc) processHello() {
 	now := time.Now()
-	t.helloLock.Lock()
-	for i := range t.helloList {
-		it := &t.helloList[i]
+	y.helloLock.Lock()
+	for i := range y.helloList {
+		it := &y.helloList[i]
 		if now.Sub(it.time) >= HelloInterval && (!it.temp || len(it.refs) > 0) {
 			it.time = now
-			_, err := t.Ygg.C.PacketConn.WriteTo([]byte{typeYrcV0_1_0, YrcHello}, it.addr)
+			_, err := y.C.PacketConn.WriteTo([]byte{typeYrcV1, YrcHello}, it.addr)
 			if err != nil {
-				t.Ygg.Log.Errorln(err)
+				if err != types.ErrClosed {
+					y.Log.Errorln(err)
+				}
 				return
 			}
 		}
 	}
-	t.helloLock.Unlock()
+	y.helloLock.Unlock()
 }
 
 // Purge stale alive entries
-func (t *Transport) processAlive() {
+func (y *Yrc) processAlive() {
 	now := time.Now()
-	t.aliveLock.Lock()
-	for i := 0; i < len(t.aliveList); {
-		if now.Sub(t.aliveList[i].time) >= AliveTimeout {
-			lenmo := len(t.aliveList)-1
-			t.aliveList[i] = t.aliveList[lenmo]
-			t.aliveList = t.aliveList[:lenmo]
+	y.aliveLock.Lock()
+	for i := 0; i < len(y.aliveList); {
+		if now.Sub(y.aliveList[i].time) >= AliveTimeout {
+			lenmo := len(y.aliveList)-1
+			y.aliveList[i] = y.aliveList[lenmo]
+			y.aliveList = y.aliveList[:lenmo]
 			continue
 		}
 		i++
 	}
-	t.aliveLock.Unlock()
+	y.aliveLock.Unlock()
 }
 
-func NewTransport(y *Ygg, ctx context.Context) *Transport {
-	tickChan := make(chan struct{})
+// Loop that receives from Ironwood directly and dispatches to the Yrc instance
+//
+// should never be called outside of New
+func (y *Yrc) recvLoop() {
+	defer y.Close()
+	
+	if y.C.PacketConn.MTU() < 128 {
+		panic("MTU is insufficient")
+	}
+	
+	bytes := make([]byte, y.C.PacketConn.MTU())
+	for {
+		n, from, err := y.C.PacketConn.ReadFrom(bytes)
+		if err != nil {
+			y.Log.Errorln(err)
+			return
+		}
+		go func(bytes []byte) {
+			if err := y.onRawData(from.(types.Addr), bytes); err != nil {
+				y.Log.Errorln(err)
+				y.Close()
+			}
+		}(cloneSlice(bytes[:n]))
+	}
+}
 
-	t := &Transport{
-		Ygg: y,
+// Loop that runs the process* functions every so often
+//
+// should never be called outside of New
+func (y *Yrc) processLoop() {
+	defer y.Close()
+	for {
+		done, cancel := context.WithTimeout(y.ctx, RefreshInterval)
+		
+		wait: for {
+			select {
+			case <-done.Done():
+				if done.Err() == context.Canceled {
+					cancel()
+					return
+				}
+				break wait
+			case <-y.tickChan:
+				break wait
+			}
+		}
+		
+		cancel()
+
+		y.processHello()
+		y.processAlive()
+		y.processStaged()
+	}
+}
+
+func SetupYggdrasil(logger core.Logger, key config.KeyBytes) (c *core.Core, m *multicast.Multicast, err error) {
+	cfg := config.GenerateConfig()
+
+	// Basic config
+	{
+		cfg.PrivateKey = key
+		cfg.AdminListen = "none"
+		cfg.NodeInfoPrivacy = true // kinda useless
+	}
+
+	cfg.GenerateSelfSignedCertificate()
+
+	privateKey := ed25519.PrivateKey(cfg.PrivateKey)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+
+	// Setup core
+	{
+		options := []core.SetupOption{
+			core.NodeInfo(cfg.NodeInfo),
+			core.NodeInfoPrivacy(cfg.NodeInfoPrivacy),
+		}
+		for _, addr := range cfg.Listen {
+			options = append(options, core.ListenAddress(addr))
+		}
+		for _, peer := range cfg.Peers {
+			options = append(options, core.Peer{URI: peer})
+		}
+		for intf, peers := range cfg.InterfacePeers {
+			for _, peer := range peers {
+				options = append(options, core.Peer{URI: peer, SourceInterface: intf})
+			}
+		}
+		for _, allowed := range cfg.AllowedPublicKeys {
+			k, err := hex.DecodeString(allowed)
+			if err != nil {
+				panic(err)
+			}
+			options = append(options, core.AllowedPublicKey(k[:]))
+		}
+		if c, err = core.New(cfg.Certificate, logger, options...); err != nil {
+			return
+		}
+	}
+
+	// Setup multicast
+	{
+		options := []multicast.SetupOption{}
+		for _, intf := range cfg.MulticastInterfaces {
+			options = append(options, multicast.MulticastInterface{
+				Regex:    regexp.MustCompile(intf.Regex),
+				Beacon:   intf.Beacon,
+				Listen:   intf.Listen,
+				Port:     intf.Port,
+				Priority: uint8(intf.Priority),
+				Password: intf.Password,
+			})
+		}
+		if m, err = multicast.New(c, logger, options...); err != nil {
+			return
+		}
+	}
+
+	logger.Debugln("Connected", hex.EncodeToString(publicKey))
+
+	return
+}
+
+func New(key config.KeyBytes, logger core.Logger, ctx context.Context) (*Yrc, error) {
+	c, m, err := SetupYggdrasil(logger, key)
+
+	if err != nil {
+		return nil, err
+	}
+
+	y := &Yrc{
+		Log: logger,
+
+		C: c,
+		M: m,
 
 		ctx: ctx,
 
@@ -990,60 +1140,11 @@ func NewTransport(y *Ygg, ctx context.Context) *Transport {
 		aliveLock: sync.RWMutex{},
 		aliveList: []AliveEntry{},
 
-		tickChan: tickChan,
+		tickChan: make(chan struct{}),
 	}
 
-	go func() {
-		func() {
-			if y.C.PacketConn.MTU() < 128 {
-				panic("MTU is insufficient")
-			}
-			bytes := make([]byte, y.C.PacketConn.MTU())
-			// TODO: make sure to exit when ctx is done
-			for {
-				n, from, err := y.C.PacketConn.ReadFrom(bytes)
-				if err != nil {
-					y.Log.Errorln(err)
-					return
-				}
-				go func(bytes []byte) {
-					if err := t.onRawData(from.(types.Addr), bytes); err != nil {
-						y.Log.Errorln(err)
-						t.Close()
-					}
-				}(cloneSlice(bytes[:n]))
-			}
-		}()
-		t.Close()
-	}()
+	go y.recvLoop()
+	go y.processLoop()
 
-	go func() {
-		func() {
-			for {
-				done, cancel := context.WithTimeout(ctx, RefreshInterval)
-				
-				wait: for {
-					select {
-					case <-done.Done():
-						if done.Err() == context.Canceled {
-							cancel()
-							return
-						}
-						break wait
-					case <-tickChan:
-						break wait
-					}
-				}
-				
-				cancel()
-
-				t.processHello()
-				t.processAlive()
-				t.processStaged()
-			}
-		}()
-		t.Close()
-	}()
-
-	return t
+	return y, nil
 }
